@@ -71,8 +71,78 @@ type
   ReplyError* = object of IOError ## Invalid reply from redis
   RedisError* = object of IOError ## Error in redis
 
+  RedisValueKind* = enum
+    vkNil,
+    vkStatus,
+    vkInteger,
+    vkString,
+    vkList
+
+  RedisValue* = object
+    case kind*: RedisValueKind
+    of vkNil: discard
+    of vkStatus, vkString: strVal*: string
+    of vkInteger: intVal*: BiggestInt
+    of vkList: listVal*: seq[RedisValue]
+
   RedisCursor* = ref object
     position*: BiggestInt
+
+proc `$`*(val: RedisValue): string =
+  case val.kind
+  of vkNil: result = "nil"
+  of vkStatus, vkString: result = val.strVal
+  of vkInteger: result = $val.intVal
+  of vkList:
+    result = "["
+    for i, elem in val.listVal:
+      if i > 0: result.add(", ")
+      result.add($elem)
+    result.add("]")
+
+proc toInt*(val: RedisValue): BiggestInt =
+  case val.kind
+  of vkInteger: result = val.intVal
+  of vkStatus, vkString: result = parseBiggestInt(val.strVal)
+  of vkNil: result = 0.BiggestInt
+  else: raise newException(ValueError, "Cannot convert Redis list to integer")
+
+proc toStr*(val: RedisValue): string =
+  case val.kind
+  of vkStatus, vkString: result = val.strVal
+  of vkInteger: result = $val.intVal
+  of vkNil: result = ""
+  else: result = $val
+
+proc toSeq*(val: RedisValue): seq[RedisValue] =
+  case val.kind
+  of vkList: result = val.listVal
+  of vkNil: result = @[]
+  else: result = @[val]
+
+proc len*(val: RedisValue): int =
+  if val.kind == vkList: result = val.listVal.len
+  elif val.kind == vkNil: result = 0
+  else: result = 1
+
+proc `[]`*(val: RedisValue, i: int): RedisValue =
+  if val.kind == vkList: result = val.listVal[i]
+  else: raise newException(IndexDefect, "RedisValue is not a list")
+
+proc `==`*(a: RedisValue, b: string): bool =
+  case a.kind
+  of vkStatus, vkString: result = (a.strVal == b)
+  else: result = false
+
+proc `==`*(a: RedisValue, b: BiggestInt): bool =
+  case a.kind
+  of vkInteger: result = (a.intVal == b)
+  else: result = false
+
+proc `==`*(a: RedisValue, b: int): bool =
+  case a.kind
+  of vkInteger: result = (a.intVal == b.BiggestInt)
+  else: result = false
 
 proc newPipeline(): Pipeline =
   new(result)
@@ -256,6 +326,33 @@ proc appendData(r: Redis | AsyncRedis, reply: RespReply, into: var RedisList) =
   of respArray:
     for element in reply.elements:
       appendData(r, element, into)
+
+proc toRedisValue*(reply: RespReply): RedisValue =
+  case reply.kind
+  of respStatus:
+    result = RedisValue(kind: vkStatus, strVal: reply.value)
+  of respError:
+    var msg = reply.value
+    if msg.len > 0 and msg[0] == '-':
+      msg = msg.substr(1).strip()
+    raise newException(RedisError, msg)
+  of respInteger:
+    result = RedisValue(kind: vkInteger, intVal: parseBiggestInt(reply.value))
+  of respBulk:
+    result = RedisValue(kind: vkString, strVal: reply.value)
+  of respNilBulk, respNilArray:
+    result = RedisValue(kind: vkNil)
+  of respArray:
+    result = RedisValue(kind: vkList, listVal: @[])
+    for elem in reply.elements:
+      result.listVal.add(toRedisValue(elem))
+
+proc readValue*(r: Redis | AsyncRedis): Future[RedisValue] {.multisync.} =
+  if r.pipeline.enabled:
+    return RedisValue(kind: vkStatus, strVal: "PIPELINED")
+  let reply = await r.readResp()
+  finaliseCommand(r)
+  result = toRedisValue(reply)
 
 proc raiseInvalidReply(r: Redis | AsyncRedis, expected, got: char) =
   raiseReplyError(r,
@@ -1443,6 +1540,72 @@ proc hPairs*(r: AsyncRedis, key: string): Future[seq[tuple[key, value: string]]]
     else:
       result.add((k, i))
       k = ""
+
+# Scripting
+
+proc eval*(r: Redis | AsyncRedis, script: string, keys: seq[string] = @[], args: seq[string] = @[]): Future[RedisValue] {.multisync.} =
+  ## Execute a Lua script server-side using EVAL.
+  var cmdArgs: seq[string] = @[script, $keys.len]
+  for k in keys:
+    cmdArgs.add(k)
+  for a in args:
+    cmdArgs.add(a)
+  await r.sendCommand("EVAL", cmdArgs)
+  result = await r.readValue()
+
+proc evalSha*(r: Redis | AsyncRedis, sha: string, keys: seq[string] = @[], args: seq[string] = @[]): Future[RedisValue] {.multisync.} =
+  ## Execute a cached Lua script server-side using its SHA1 digest via EVALSHA.
+  var cmdArgs: seq[string] = @[sha, $keys.len]
+  for k in keys:
+    cmdArgs.add(k)
+  for a in args:
+    cmdArgs.add(a)
+  await r.sendCommand("EVALSHA", cmdArgs)
+  result = await r.readValue()
+
+proc evalInt*(r: Redis | AsyncRedis, script: string, keys: seq[string] = @[], args: seq[string] = @[]): Future[BiggestInt] {.multisync.} =
+  ## Convenience helper to execute a Lua script and return the result as an integer.
+  let val = await r.eval(script, keys, args)
+  result = val.toInt()
+
+proc evalString*(r: Redis | AsyncRedis, script: string, keys: seq[string] = @[], args: seq[string] = @[]): Future[string] {.multisync.} =
+  ## Convenience helper to execute a Lua script and return the result as a string.
+  let val = await r.eval(script, keys, args)
+  result = val.toStr()
+
+proc evalList*(r: Redis | AsyncRedis, script: string, keys: seq[string] = @[], args: seq[string] = @[]): Future[seq[RedisValue]] {.multisync.} =
+  ## Convenience helper to execute a Lua script and return the result as a list of RedisValues.
+  let val = await r.eval(script, keys, args)
+  result = val.toSeq()
+
+proc scriptLoad*(r: Redis | AsyncRedis, script: string): Future[string] {.multisync.} =
+  ## Load a script into the scripts cache without executing it. Returns the SHA1 digest.
+  await r.sendCommand("SCRIPT", @["LOAD", script])
+  result = await r.readBulkString()
+
+proc scriptExists*(r: Redis | AsyncRedis, shas: seq[string]): Future[seq[bool]] {.multisync.} =
+  ## Check existence of scripts in the script cache by their SHA1 digests.
+  var args: seq[string] = @["EXISTS"]
+  for s in shas:
+    args.add(s)
+  await r.sendCommand("SCRIPT", args)
+  let rawList = await r.readArray()
+  result = @[]
+  for item in rawList:
+    result.add(item == "1")
+
+proc scriptFlush*(r: Redis | AsyncRedis, async = false): Future[RedisStatus] {.multisync.} =
+  ## Flush the Lua scripts cache.
+  if async:
+    await r.sendCommand("SCRIPT", @["FLUSH", "ASYNC"])
+  else:
+    await r.sendCommand("SCRIPT", @["FLUSH"])
+  result = await r.readStatus()
+
+proc scriptKill*(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
+  ## Kill the currently executing Lua script.
+  await r.sendCommand("SCRIPT", @["KILL"])
+  result = await r.readStatus()
 
 type
   SendMode = enum
