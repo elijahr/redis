@@ -698,10 +698,66 @@ proc ttl*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.
   await r.sendCommand("TTL", key)
   return await r.readInteger()
 
-proc keyType*(r: Redis, key: string): RedisStatus =
+proc keyType*(r: Redis | AsyncRedis, key: string): Future[RedisStatus] {.multisync.} =
   ## Determine the type stored at key
-  r.sendCommand("TYPE", key)
-  result = r.readStatus()
+  await r.sendCommand("TYPE", key)
+  result = await r.readStatus()
+
+proc unlink*(r: Redis | AsyncRedis, keys: seq[string]): Future[RedisInteger] {.multisync.} =
+  ## Delete a key or multiple keys asynchronously in a background thread.
+  await r.sendCommand("UNLINK", keys)
+  result = await r.readInteger()
+
+proc unlink*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Delete a key asynchronously in a background thread.
+  await r.sendCommand("UNLINK", @[key])
+  result = await r.readInteger()
+
+proc touch*(r: Redis | AsyncRedis, keys: seq[string]): Future[RedisInteger] {.multisync.} =
+  ## Alters the last access time of a key(s). Returns the number of keys that were touched.
+  await r.sendCommand("TOUCH", keys)
+  result = await r.readInteger()
+
+proc touch*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Alters the last access time of a key. Returns 1 if key exists, 0 otherwise.
+  await r.sendCommand("TOUCH", @[key])
+  result = await r.readInteger()
+
+proc copy*(r: Redis | AsyncRedis, src, dst: string, db: int = -1, replace: bool = false): Future[bool] {.multisync.} =
+  ## Copy a key to another key. Returns true if the key was copied.
+  var args: seq[string] = @[src, dst]
+  if db >= 0:
+    args.add("DB")
+    args.add($db)
+  if replace:
+    args.add("REPLACE")
+  await r.sendCommand("COPY", args)
+  result = (await r.readInteger()) == 1
+
+proc pexpire*(r: Redis | AsyncRedis, key: string, milliseconds: BiggestInt): Future[bool] {.multisync.} =
+  ## Set a key's time to live in milliseconds.
+  await r.sendCommand("PEXPIRE", key, @[$milliseconds])
+  result = (await r.readInteger()) == 1
+
+proc pexpireAt*(r: Redis | AsyncRedis, key: string, timestampMs: BiggestInt): Future[bool] {.multisync.} =
+  ## Set the expiration for a key as a UNIX timestamp in milliseconds.
+  await r.sendCommand("PEXPIREAT", key, @[$timestampMs])
+  result = (await r.readInteger()) == 1
+
+proc pttl*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Get the time to live for a key in milliseconds.
+  await r.sendCommand("PTTL", @[key])
+  result = await r.readInteger()
+
+proc expireTime*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Get the expiration Unix timestamp for a key in seconds.
+  await r.sendCommand("EXPIRETIME", @[key])
+  result = await r.readInteger()
+
+proc pexpireTime*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Get the expiration Unix timestamp for a key in milliseconds.
+  await r.sendCommand("PEXPIRETIME", @[key])
+  result = await r.readInteger()
 
 
 # Strings
@@ -821,6 +877,40 @@ proc strlen*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisy
   ## exist.
   await r.sendCommand("STRLEN", key)
   result = await r.readInteger()
+
+proc getDel*(r: Redis | AsyncRedis, key: string): Future[RedisString] {.multisync.} =
+  ## Get the value of a key and delete the key atomically.
+  await r.sendCommand("GETDEL", key)
+  result = await r.readBulkString()
+
+proc getEx*(r: Redis | AsyncRedis, key: string, seconds: int = -1, pseconds: BiggestInt = -1, persist: bool = false): Future[RedisString] {.multisync.} =
+  ## Get the value of a key and optionally set its expiration.
+  var args: seq[string] = @[key]
+  if persist:
+    args.add("PERSIST")
+  elif seconds >= 0:
+    args.add("EX")
+    args.add($seconds)
+  elif pseconds >= 0:
+    args.add("PX")
+    args.add($pseconds)
+  await r.sendCommand("GETEX", args)
+  result = await r.readBulkString()
+
+proc msetnx*(r: Redis | AsyncRedis, pairs: openArray[(string, string)]): Future[bool] {.multisync.} =
+  ## Set multiple keys to multiple values, only if none of the keys exist.
+  var args: seq[string] = @[]
+  for (k, v) in pairs:
+    args.add(k)
+    args.add(v)
+  await r.sendCommand("MSETNX", args)
+  result = (await r.readInteger()) == 1
+
+proc incrByFloat*(r: Redis | AsyncRedis, key: string, increment: float): Future[float] {.multisync.} =
+  ## Increment the float value of a key by the given amount.
+  await r.sendCommand("INCRBYFLOAT", key, @[$increment])
+  let res = await r.readBulkString()
+  result = parseFloat(res)
 
 # Hashes
 proc hDel*(r: Redis | AsyncRedis, key, field: string): Future[bool] {.multisync.} =
@@ -1405,6 +1495,16 @@ proc ping*(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   ## Ping the server
   await r.sendCommand("PING")
   result = await r.readStatus()
+
+proc ping*(r: Redis | AsyncRedis, message: string): Future[RedisString] {.multisync.} =
+  ## Ping the server with a custom message. Returns the message.
+  await r.sendCommand("PING", message)
+  result = await r.readBulkString()
+
+proc hello*(r: Redis | AsyncRedis, protover: int = 2): Future[RedisValue] {.multisync.} =
+  ## Switch protocol or handshake with Redis 6+.
+  await r.sendCommand("HELLO", @[$protover])
+  result = await r.readValue()
 
 proc close*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection
