@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-linux:
+    name: ubuntu-latest - Nim ${{ matrix.nim-version }} (${{ matrix.server.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary supported compiler (Nim 2.2.x) across key engine generations
+          - nim-version: '2.2.x'
+            server:
+              name: Redis 5
+              image: redis:5
+          - nim-version: '2.2.x'
+            server:
+              name: Redis 7
+              image: redis:7
+          - nim-version: '2.2.x'
+            server:
+              name: Valkey 8.0
+              image: valkey/valkey:8.0
+          # Older LTS compiler (Nim 2.0.x) verified against standard Redis
+          - nim-version: '2.0.x'
+            server:
+              name: Redis 7
+              image: redis:7
+          # Bleeding edge compiler (Nim devel) verified against latest engine
+          - nim-version: 'devel'
+            server:
+              name: Valkey 8.0
+              image: valkey/valkey:8.0
+
+    services:
+      redis:
+        image: ${{ matrix.server.image }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.nim-version }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run test suite
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+        run: |
+          nimble test
+
+      - name: Build documentation
+        run: |
+          nimble docs
+
+  test-macos:
+    name: macos-latest - Nim 2.2.x (Redis brew)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start Redis on macOS
+        run: |
+          brew install redis || true
+          redis-server --daemonize yes
+          sleep 2
+          redis-cli ping
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run test suite
+        run: |
+          nimble test

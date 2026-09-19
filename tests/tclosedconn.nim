@@ -7,22 +7,34 @@ import asyncnet, asyncdispatch, strutils, unittest, redis
 
 const mockPort = 5314.Port
 
-proc mockDroppingServer() {.async.} =
-  var server = newAsyncSocket()
-  server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(mockPort)
-  server.listen()
+var mockServer: AsyncSocket
 
-  while true:
-    let c = await server.accept()
+proc mockDroppingServer() {.async.} =
+  mockServer = newAsyncSocket()
+  mockServer.setSockOpt(OptReuseAddr, true)
+  mockServer.bindAddr(mockPort)
+  mockServer.listen()
+
+  while not mockServer.isClosed():
+    let c = try:
+      await mockServer.accept()
+    except CatchableError:
+      break
     # Read one complete RESP request, whatever the command or arity:
     # "*<argc>" followed by argc bulk strings of two lines each
     # ("$<len>", payload). Draining the full request before closing
     # makes the close a clean EOF for the client rather than a reset.
-    let header = await c.recvLine()
+    let header = try:
+      await c.recvLine()
+    except CatchableError:
+      c.close()
+      continue
     if header.len > 1 and header[0] == '*':
-      for _ in 1 .. 2 * parseInt(header.substr(1)):
-        discard await c.recvLine()
+      try:
+        for _ in 1 .. 2 * parseInt(header.substr(1)):
+          discard await c.recvLine()
+      except CatchableError:
+        discard
     c.close()
 
 suite "closed connection handling":
@@ -64,3 +76,6 @@ suite "closed connection handling":
       expect RedisError:
         await r.setk("some:key", "value")
     waitFor run()
+
+if mockServer != nil and not mockServer.isClosed():
+  mockServer.close()
