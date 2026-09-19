@@ -17,3 +17,4 @@ task docs, "Build documentation":
 task test, "Run tests":
   exec "nim c -r tests/main.nim"
   exec "nim c -r --threads:on tests/main.nim"
+  exec "nim c -r tests/tclosedconn.nim"

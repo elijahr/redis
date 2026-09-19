@@ -19,6 +19,7 @@ deinstall.sh
 doc/*.html
 doc/*.pdf
 doc/*.idx
+docs/
 /web/upload
 build/*
 bin/*
@@ -42,3 +43,8 @@ xcuserdata/
 /testresults.json
 testament.db
 /csources
+*.dSYM/
+.*
+!.gitignore
+!.github/
+!.editorconfig
