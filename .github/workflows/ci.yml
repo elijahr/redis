@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+
+jobs:
+  test-linux:
+    name: ubuntu-latest - Nim ${{ matrix.nim-version }} (Redis ${{ matrix.redis-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nim-version: ['2.0.x', '2.2.x']
+        redis-version: ['5', '6', '7']
+
+    services:
+      redis:
+        image: redis:${{ matrix.redis-version }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.nim-version }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run test suite
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          REDIS_TEST_DB: '15'
+        run: |
+          nimble test
+
+      - name: Build documentation
+        run: |
+          nimble docs
+
+  test-macos:
+    name: macos-latest - Nim 2.2.x (Redis brew)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start Redis on macOS
+        run: |
+          brew install redis || true
+          redis-server --daemonize yes
+          sleep 2
+          redis-cli ping
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run test suite
+        run: |
+          REDIS_TEST_DB=15 nimble test

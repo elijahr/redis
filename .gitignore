@@ -42,3 +42,5 @@ xcuserdata/
 /testresults.json
 testament.db
 /csources
+*.dSYM/
+.locutus.agent
