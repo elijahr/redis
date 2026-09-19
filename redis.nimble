@@ -19,6 +19,7 @@ task test, "Run tests":
   exec "nim c -r --threads:on tests/main.nim"
   exec "nim c -r tests/tclosedconn.nim"
   exec "nim c -r tests/tscripting.nim"
+  exec "nim c -r tests/trawcommand.nim"
 
 task test_matrix, "Run tests against Redis 5, 6, 7 matrix locally":
   exec "bash tests/run_matrix.sh"

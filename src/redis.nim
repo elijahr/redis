@@ -1607,6 +1607,27 @@ proc scriptKill*(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   await r.sendCommand("SCRIPT", @["KILL"])
   result = await r.readStatus()
 
+# Raw command execution
+
+proc rawCommand*(r: Redis | AsyncRedis, cmd: string, args: seq[string]): Future[RedisValue] {.multisync.} =
+  ## Execute an arbitrary Redis command with arguments and return a dynamic RedisValue.
+  await r.sendCommand(cmd, args)
+  result = await r.readValue()
+
+proc rawCommand*(r: Redis, cmd: string, args: varargs[string]): RedisValue =
+  ## Execute an arbitrary Redis command with varargs arguments and return a dynamic RedisValue.
+  var argSeq: seq[string] = @[]
+  for a in args:
+    argSeq.add(a)
+  result = r.rawCommand(cmd, argSeq)
+
+proc rawCommand*(r: AsyncRedis, cmd: string, args: varargs[string]): Future[RedisValue] =
+  ## Execute an arbitrary Redis command with varargs arguments and return a dynamic RedisValue.
+  var argSeq: seq[string] = @[]
+  for a in args:
+    argSeq.add(a)
+  result = r.rawCommand(cmd, argSeq)
+
 type
   SendMode = enum
     normal, pipelined, multiple
