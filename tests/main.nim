@@ -168,7 +168,38 @@ template syncTests() =
 
     check res == @["OK"]
 
-  # TODO: Ideally tests for all other procedures, will add these in the future
+  test "issue #19: multi-member sadd, srem, slrem":
+    discard r.del(@["test:set19"])
+    check r.sadd("test:set19", @["a", "b", "c"]) == 3
+    check r.scard("test:set19") == 3
+    check r.srem("test:set19", @["a", "b"]) == 2
+    check r.scard("test:set19") == 1
+    check r.slrem("test:set19", @["c"]) == 1
+    check r.scard("test:set19") == 0
+
+  test "issue #50: flushPipelineValues and execValues positional integrity":
+    discard r.del(@["test:pk1", "test:pk2", "test:pcount"])
+    r.startPipelining()
+    r.setk("test:pk1", "v1")
+    discard r.get("test:pk1")
+    discard r.incr("test:pcount")
+    discard r.get("test:pk_nonexistent")
+    let pVals = r.flushPipelineValues()
+    check pVals.len == 4
+    check pVals[0].kind == vkStatus and pVals[0].toStr == "OK"
+    check pVals[1].kind == vkString and pVals[1].toStr == "v1"
+    check pVals[2].kind == vkInteger and pVals[2].toInt == 1
+    check pVals[3].kind == vkNil
+
+    r.multi()
+    r.setk("test:pk2", "v2")
+    discard r.get("test:pk2")
+    discard r.incr("test:pcount")
+    let eVals = r.execValues()
+    check eVals.len == 3
+    check eVals[0].kind == vkStatus and eVals[0].toStr == "OK"
+    check eVals[1].kind == vkString and eVals[1].toStr == "v2"
+    check eVals[2].kind == vkInteger and eVals[2].toInt == 2
 
   # delete all keys in the DB at the end of the tests
   discard r.flushdb()
@@ -224,8 +255,64 @@ suite "redis async tests":
       doAssert (await sub.nextMessage()).message == "one"
       doAssert (await sub.nextMessage()).message == "two"
       doAssert (await sub.nextMessage()).message == "three"
+      await sub.unsubscribe("channel1")
+      await sub.quit()
+      await pub.quit()
 
     waitFor main()
+
+  test "issue #34: subscribe does not break subsequent commands or quit":
+    proc testSubQuit() {.async.} =
+      let sub = await openAsyncTestClient()
+      await sub.subscribe("issue34-channel")
+      await sub.unsubscribe("issue34-channel")
+      await sub.quit()
+
+      let sub2 = await openAsyncTestClient()
+      await sub2.subscribe("issue34-channel2")
+      # quit immediately while subscribed without explicit unsubscribe
+      await sub2.quit()
+
+    waitFor testSubQuit()
+
+  test "issue #19 (async): multi-member sadd, srem, slrem":
+    proc testSets() {.async.} =
+      discard await r.del(@["test:async:set19"])
+      check (await r.sadd("test:async:set19", @["x", "y", "z"])) == 3
+      check (await r.scard("test:async:set19")) == 3
+      check (await r.srem("test:async:set19", @["x", "y"])) == 2
+      check (await r.scard("test:async:set19")) == 1
+      check (await r.slrem("test:async:set19", @["z"])) == 1
+      check (await r.scard("test:async:set19")) == 0
+
+    waitFor testSets()
+
+  test "issue #50 (async): flushPipelineValues and execValues positional integrity":
+    proc testPipelines() {.async.} =
+      discard await r.del(@["test:async:pk1", "test:async:pk2", "test:async:pcount"])
+      r.startPipelining()
+      discard r.setk("test:async:pk1", "v1")
+      discard r.get("test:async:pk1")
+      discard r.incr("test:async:pcount")
+      discard r.get("test:async:nonexistent")
+      let pVals = await r.flushPipelineValues()
+      check pVals.len == 4
+      check pVals[0].kind == vkStatus and pVals[0].toStr == "OK"
+      check pVals[1].kind == vkString and pVals[1].toStr == "v1"
+      check pVals[2].kind == vkInteger and pVals[2].toInt == 1
+      check pVals[3].kind == vkNil
+
+      await r.multi()
+      discard r.setk("test:async:pk2", "v2")
+      discard r.get("test:async:pk2")
+      discard r.incr("test:async:pcount")
+      let eVals = await r.execValues()
+      check eVals.len == 3
+      check eVals[0].kind == vkStatus and eVals[0].toStr == "OK"
+      check eVals[1].kind == vkString and eVals[1].toStr == "v2"
+      check eVals[2].kind == vkInteger and eVals[2].toInt == 2
+
+    waitFor testPipelines()
 
   discard waitFor r.flushdb()
   waitFor r.quit()
