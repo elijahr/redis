@@ -22,3 +22,4 @@ task test, "Run tests":
   exec "nim c -r tests/trawcommand.nim"
   exec "nim c -r tests/tmodernverbs.nim"
   exec "nim c -r tests/titerators.nim"
+  exec "nim c -r tests/tstreams.nim"
