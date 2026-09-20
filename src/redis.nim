@@ -34,7 +34,7 @@
 ##
 ##    waitFor main()
 
-import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, nativesockets, random, math
 
 const
   redisNil* = "\0\0"
@@ -46,9 +46,24 @@ type
     expected: int ## number of replies expected if pipelined
 
   RedisBase[TSocket] = ref object of RootObj
-    socket: TSocket
-    connected: bool
-    pipeline: Pipeline
+    socket*: TSocket
+    connected*: bool
+    pipeline*: Pipeline
+    host*: string
+    port*: Port
+    isUnix*: bool
+    unixPath*: string
+    username*: string
+    password*: string
+    db*: int
+    connectTimeoutMs*: int
+    readTimeoutMs*: int
+    maxRetries*: int
+    retryIntervalMs*: int
+    maxRetryIntervalMs*: int
+    backoffMultiplier*: float
+    retryOnTimeout*: bool
+    autoReconnect*: bool
 
   Redis* = ref object of RedisBase[net.Socket]
     ## A synchronous redis client.
@@ -68,8 +83,13 @@ type
     ## Pub/Sub
     channel*: string
     message*: string
-  ReplyError* = object of IOError ## Invalid reply from redis
-  RedisError* = object of IOError ## Error in redis
+  RedisError* = object of IOError ## Base error in redis
+  ReplyError* = object of RedisError ## Invalid reply from redis
+  RedisProtocolError* = object of ReplyError ## Protocol framing or serialization error
+  RedisConnectionError* = object of RedisError ## Connection establishment or socket drop error
+  RedisTimeoutError* = object of RedisConnectionError ## Connection or socket action timeout
+  RedisResponseError* = object of RedisError ## Server error reply (e.g. -ERR, -WRONGTYPE)
+    errorCode*: string
 
   RedisValueKind* = enum
     vkNil,
@@ -172,6 +192,14 @@ proc `==`*(a: RedisValue, b: int): bool =
 
 proc `==`*(a: int, b: RedisValue): bool = b == a
 
+proc calculateBackoffMs*(attempt: int, initialMs = 100, maxMs = 5000, multiplier = 2.0): int =
+  ## Calculate exponential backoff with full jitter for connection retry attempts.
+  let expBackoff = int(float(initialMs) * pow(multiplier, float(attempt)))
+  let cap = min(maxMs, expBackoff)
+  if cap <= 0: return 0
+  let minWait = cap div 2
+  return minWait + rand(cap - minWait)
+
 proc newPipeline(): Pipeline =
   new(result)
   result.buffer = ""
@@ -204,43 +232,122 @@ proc hasField*(entry: StreamEntry, field: string): bool =
     if f == field: return true
   return false
 
-proc open*(host = "localhost", port = 6379.Port): Redis =
+proc reconnect*(r: Redis) {.gcsafe.}
+proc reconnect*(r: AsyncRedis): Future[void] {.gcsafe.}
+
+proc open*(host = "localhost", port = 6379.Port,
+           password = "", username = "", db = 0,
+           connectTimeoutMs = -1, readTimeoutMs = -1,
+           maxRetries = 0, retryIntervalMs = 100, maxRetryIntervalMs = 5000,
+           backoffMultiplier = 2.0, retryOnTimeout = false,
+           autoReconnect = false): Redis =
   ## Open a synchronous connection to a redis server.
   result = Redis(
-    socket: newSocket(buffered = true),
-    pipeline: newPipeline()
+    socket: nil,
+    pipeline: newPipeline(),
+    host: host,
+    port: port,
+    isUnix: false,
+    unixPath: "",
+    username: username,
+    password: password,
+    db: db,
+    connectTimeoutMs: connectTimeoutMs,
+    readTimeoutMs: readTimeoutMs,
+    maxRetries: maxRetries,
+    retryIntervalMs: retryIntervalMs,
+    maxRetryIntervalMs: maxRetryIntervalMs,
+    backoffMultiplier: backoffMultiplier,
+    retryOnTimeout: retryOnTimeout,
+    autoReconnect: autoReconnect
   )
+  result.reconnect()
 
-  result.socket.connect(host, port)
-
-proc openUnix*(path = "/var/run/redis/redis.sock"): Redis =
+proc openUnix*(path = "/var/run/redis/redis.sock",
+               password = "", username = "", db = 0,
+               connectTimeoutMs = -1, readTimeoutMs = -1,
+               maxRetries = 0, retryIntervalMs = 100, maxRetryIntervalMs = 5000,
+               backoffMultiplier = 2.0, retryOnTimeout = false,
+               autoReconnect = false): Redis =
   ## Open a synchronous unix connection to a redis server.
   result = Redis(
-    socket: newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
-    pipeline: newPipeline()
+    socket: nil,
+    pipeline: newPipeline(),
+    host: "",
+    port: 0.Port,
+    isUnix: true,
+    unixPath: path,
+    username: username,
+    password: password,
+    db: db,
+    connectTimeoutMs: connectTimeoutMs,
+    readTimeoutMs: readTimeoutMs,
+    maxRetries: maxRetries,
+    retryIntervalMs: retryIntervalMs,
+    maxRetryIntervalMs: maxRetryIntervalMs,
+    backoffMultiplier: backoffMultiplier,
+    retryOnTimeout: retryOnTimeout,
+    autoReconnect: autoReconnect
   )
+  result.reconnect()
 
-  result.socket.connectUnix(path)
-
-proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.async.} =
+proc openAsync*(host = "localhost", port = 6379.Port,
+                password = "", username = "", db = 0,
+                connectTimeoutMs = -1, readTimeoutMs = -1,
+                maxRetries = 0, retryIntervalMs = 100, maxRetryIntervalMs = 5000,
+                backoffMultiplier = 2.0, retryOnTimeout = false,
+                autoReconnect = false): Future[AsyncRedis] {.async.} =
   ## Open an asynchronous connection to a redis server.
   result = AsyncRedis(
-    socket: newAsyncSocket(buffered = true),
+    socket: nil,
     pipeline: newPipeline(),
-    sendQueue: initDeque[Future[void]]()
+    sendQueue: initDeque[Future[void]](),
+    host: host,
+    port: port,
+    isUnix: false,
+    unixPath: "",
+    username: username,
+    password: password,
+    db: db,
+    connectTimeoutMs: connectTimeoutMs,
+    readTimeoutMs: readTimeoutMs,
+    maxRetries: maxRetries,
+    retryIntervalMs: retryIntervalMs,
+    maxRetryIntervalMs: maxRetryIntervalMs,
+    backoffMultiplier: backoffMultiplier,
+    retryOnTimeout: retryOnTimeout,
+    autoReconnect: autoReconnect
   )
+  await result.reconnect()
 
-  await result.socket.connect(host, port)
-
-proc openUnixAsync*(path = "/var/run/redis/redis.sock"): Future[AsyncRedis] {.async.} =
+proc openUnixAsync*(path = "/var/run/redis/redis.sock",
+                    password = "", username = "", db = 0,
+                    connectTimeoutMs = -1, readTimeoutMs = -1,
+                    maxRetries = 0, retryIntervalMs = 100, maxRetryIntervalMs = 5000,
+                    backoffMultiplier = 2.0, retryOnTimeout = false,
+                    autoReconnect = false): Future[AsyncRedis] {.async.} =
   ## Open an asynchronous unix connection to a redis server.
   result = AsyncRedis(
-    socket: newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
+    socket: nil,
     pipeline: newPipeline(),
-    sendQueue: initDeque[Future[void]]()
+    sendQueue: initDeque[Future[void]](),
+    host: "",
+    port: 0.Port,
+    isUnix: true,
+    unixPath: path,
+    username: username,
+    password: password,
+    db: db,
+    connectTimeoutMs: connectTimeoutMs,
+    readTimeoutMs: readTimeoutMs,
+    maxRetries: maxRetries,
+    retryIntervalMs: retryIntervalMs,
+    maxRetryIntervalMs: maxRetryIntervalMs,
+    backoffMultiplier: backoffMultiplier,
+    retryOnTimeout: retryOnTimeout,
+    autoReconnect: autoReconnect
   )
-
-  await result.socket.connectUnix(path)
+  await result.reconnect()
 
 proc finaliseCommand(r: Redis | AsyncRedis) =
   when r is AsyncRedis:
@@ -255,14 +362,75 @@ proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
 
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
-  raise newException(RedisError, msg)
+  var code = ""
+  if msg.len > 0:
+    let parts = msg.split(' ', 1)
+    code = parts[0]
+    if code.startsWith("-"):
+      code = code.substr(1)
+  var ex = newException(RedisResponseError, msg)
+  ex.errorCode = code
+  raise ex
+
+proc isSocketClosed*(s: net.Socket): bool =
+  s == nil or s.getFd() == osInvalidSocket
+
+proc isSocketClosed*(s: asyncnet.AsyncSocket): bool =
+  s == nil or s.isClosed()
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string
 ): Future[void] {.multisync.} =
   when r is Redis:
-    r.socket.send(data)
+    if (not r.connected or isSocketClosed(r.socket)) and r.autoReconnect:
+      var attempt = 0
+      var reconnected = false
+      while not reconnected:
+        try:
+          r.reconnect()
+          reconnected = true
+        except CatchableError as e:
+          if r.maxRetries > 0 and attempt >= r.maxRetries:
+            raise newException(RedisConnectionError, "Auto-reconnect failed after " & $attempt & " retries: " & e.msg, e)
+          let waitTime = calculateBackoffMs(attempt, r.retryIntervalMs, r.maxRetryIntervalMs, r.backoffMultiplier)
+          sleep(waitTime)
+          attempt.inc()
+    try:
+      r.socket.send(data)
+    except CatchableError as sendErr:
+      r.connected = false
+      try: r.socket.close() except CatchableError: discard
+      if r.autoReconnect:
+        var attempt = 0
+        var reconnected = false
+        while not reconnected:
+          try:
+            r.reconnect()
+            reconnected = true
+          except CatchableError as e:
+            if r.maxRetries > 0 and attempt >= r.maxRetries:
+              raise newException(RedisConnectionError, "Auto-reconnect failed after " & $attempt & " retries: " & e.msg, e)
+            let waitTime = calculateBackoffMs(attempt, r.retryIntervalMs, r.maxRetryIntervalMs, r.backoffMultiplier)
+            sleep(waitTime)
+            attempt.inc()
+        r.socket.send(data)
+      else:
+        raise newException(RedisConnectionError, "Send failed: " & sendErr.msg, sendErr)
   else:
+    if (not r.connected or isSocketClosed(r.socket)) and r.autoReconnect:
+      var attempt = 0
+      var reconnected = false
+      while not reconnected:
+        try:
+          await r.reconnect()
+          reconnected = true
+        except CatchableError as e:
+          if r.maxRetries > 0 and attempt >= r.maxRetries:
+            raise newException(RedisConnectionError, "Auto-reconnect failed after " & $attempt & " retries: " & e.msg, e)
+          let waitTime = calculateBackoffMs(attempt, r.retryIntervalMs, r.maxRetryIntervalMs, r.backoffMultiplier)
+          await sleepAsync(waitTime)
+          attempt.inc()
+
     proc doSend() =
       r.currentCommand = some(data)
       asyncCheck r.socket.send(data)
@@ -280,27 +448,95 @@ proc managedRecv(
   result = newString(size)
 
   when r is Redis:
-    if r.socket.recv(result, size) != size:
-      raiseReplyError(r, "recv failed")
+    if r.readTimeoutMs > 0:
+      var numRecv = 0
+      try:
+        numRecv = r.socket.recv(result, size, timeout = r.readTimeoutMs)
+      except net.TimeoutError:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read timed out after " & $r.readTimeoutMs & "ms")
+      except CatchableError as e:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisConnectionError, "Recv failed: " & e.msg, e)
+      if numRecv != size:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        raiseReplyError(r, "recv failed")
+    else:
+      if r.socket.recv(result, size) != size:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        raiseReplyError(r, "recv failed")
   else:
-    let numReceived = await r.socket.recvInto(addr result[0], size)
-    if numReceived != size:
-      raiseReplyError(r, "recv failed")
+    if r.readTimeoutMs > 0:
+      let fut = r.socket.recvInto(addr result[0], size)
+      if not await withTimeout(fut, r.readTimeoutMs):
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read timed out after " & $r.readTimeoutMs & "ms")
+      if fut.failed:
+        r.connected = false
+        finaliseCommand(r)
+        raise fut.readError()
+      let numReceived = fut.read()
+      if numReceived != size:
+        r.connected = false
+        raiseReplyError(r, "recv failed")
+    else:
+      let numReceived = await r.socket.recvInto(addr result[0], size)
+      if numReceived != size:
+        r.connected = false
+        raiseReplyError(r, "recv failed")
 
 proc managedRecvLine(r: Redis | AsyncRedis): Future[string] {.multisync.} =
   if r.pipeline.enabled:
     return ""
 
   when r is Redis:
-    result = recvLine(r.socket)
+    if r.readTimeoutMs > 0:
+      try:
+        result = recvLine(r.socket, timeout = r.readTimeoutMs)
+      except net.TimeoutError:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read line timed out after " & $r.readTimeoutMs & "ms")
+      except CatchableError as e:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisConnectionError, "Recv line failed: " & e.msg, e)
+    else:
+      result = recvLine(r.socket)
   else:
-    result = await recvLine(r.socket)
+    if r.readTimeoutMs > 0:
+      let fut = recvLine(r.socket)
+      if not await withTimeout(fut, r.readTimeoutMs):
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read line timed out after " & $r.readTimeoutMs & "ms")
+      if fut.failed:
+        r.connected = false
+        finaliseCommand(r)
+        raise fut.readError()
+      result = fut.read()
+    else:
+      result = await recvLine(r.socket)
 
   # recvLine returns "" only when the peer closed the connection; an empty
   # protocol line would be returned as "\r\L". Raise here so callers can
   # treat an empty result as the pipelining dummy.
   if result.len == 0:
-    raiseRedisError(r, "Server closed connection prematurely")
+    r.connected = false
+    try: r.socket.close() except CatchableError: discard
+    finaliseCommand(r)
+    raise newException(RedisConnectionError, "Server closed connection prematurely")
 
 type
   RespKind = enum
@@ -381,7 +617,15 @@ proc toRedisValue*(reply: RespReply): RedisValue =
     var msg = reply.value
     if msg.len > 0 and msg[0] == '-':
       msg = msg.substr(1).strip()
-    raise newException(RedisError, msg)
+    var code = ""
+    if msg.len > 0:
+      let parts = msg.split(' ', 1)
+      code = parts[0]
+      if code.startsWith("-"):
+        code = code.substr(1)
+    var ex = newException(RedisResponseError, msg)
+    ex.errorCode = code
+    raise ex
   of respInteger:
     result = RedisValue(kind: vkInteger, intVal: parseBiggestInt(reply.value))
   of respBulk:
@@ -1833,11 +2077,15 @@ proc auth*(r: Redis | AsyncRedis, password: string): Future[void] {.multisync.} 
   ## Authenticate to the server
   await r.sendCommand("AUTH", password)
   raiseNoOK(r, await r.readStatus())
+  r.username = ""
+  r.password = password
 
 proc auth*(r: Redis | AsyncRedis, username: string, password: string): Future[void] {.multisync.} =
   ## Authenticate to a server that uses Redis ACLs
   await r.sendCommand("AUTH", @[username, password])
   raiseNoOK(r, await r.readStatus())
+  r.username = username
+  r.password = password
 
 proc echoServ*(r: Redis | AsyncRedis, message: string): Future[RedisString] {.multisync.} =
   ## Echo the given string
@@ -1861,19 +2109,115 @@ proc hello*(r: Redis | AsyncRedis, protover: int = 2): Future[RedisValue] {.mult
 
 proc close*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection
-  r.socket.close()
+  r.connected = false
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
 
 proc quit*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection with using QUIT command
   ## Note: This command is regarded as deprecated since Redis version 7.2.0.
   await r.sendCommand("QUIT")
   raiseNoOK(r, await r.readStatus())
-  r.socket.close()
+  r.connected = false
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
 
 proc select*(r: Redis | AsyncRedis, index: int): Future[RedisStatus] {.multisync.} =
   ## Change the selected database for the current connection
   await r.sendCommand("SELECT", $index)
   result = await r.readStatus()
+  r.db = index
+
+proc isConnected*(r: Redis | AsyncRedis): bool =
+  ## Returns true if the client is currently marked connected and socket is open.
+  r.connected and not isSocketClosed(r.socket)
+
+proc setTimeouts*(r: Redis | AsyncRedis, connectTimeoutMs: int = -1, readTimeoutMs: int = -1) =
+  ## Dynamically update the connect and read timeouts (in milliseconds).
+  ## Pass -1 to disable timeout.
+  r.connectTimeoutMs = connectTimeoutMs
+  r.readTimeoutMs = readTimeoutMs
+
+proc reconnect*(r: Redis) =
+  ## Reconnect a synchronous Redis client to the configured server.
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
+
+  r.connected = false
+  if r.isUnix:
+    r.socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
+    r.socket.connectUnix(r.unixPath)
+  else:
+    r.socket = newSocket(buffered = true)
+    if r.connectTimeoutMs > 0:
+      try:
+        r.socket.connect(r.host, r.port, timeout = r.connectTimeoutMs)
+      except net.TimeoutError:
+        r.socket.close()
+        raise newException(RedisTimeoutError, "Connection to " & r.host & ":" & $r.port.int & " timed out after " & $r.connectTimeoutMs & "ms")
+    else:
+      r.socket.connect(r.host, r.port)
+
+  r.connected = true
+
+  if r.username.len > 0:
+    r.auth(r.username, r.password)
+  elif r.password.len > 0:
+    r.auth(r.password)
+  if r.db != 0:
+    discard r.select(r.db)
+
+proc reconnect*(r: AsyncRedis): Future[void] {.async.} =
+  ## Reconnect an asynchronous Redis client to the configured server.
+  r.currentCommand = none(string)
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
+
+  r.connected = false
+  if r.isUnix:
+    r.socket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
+    await r.socket.connectUnix(r.unixPath)
+  else:
+    r.socket = newAsyncSocket(buffered = true)
+    if r.connectTimeoutMs > 0:
+      let connectFut = r.socket.connect(r.host, r.port)
+      if not await withTimeout(connectFut, r.connectTimeoutMs):
+        r.connected = false
+        try:
+          r.socket.close()
+        except CatchableError:
+          discard
+        raise newException(RedisTimeoutError, "Connection to " & r.host & ":" & $r.port.int & " timed out after " & $r.connectTimeoutMs & "ms")
+      if connectFut.failed:
+        r.connected = false
+        try:
+          r.socket.close()
+        except CatchableError:
+          discard
+        raise connectFut.readError()
+    else:
+      await r.socket.connect(r.host, r.port)
+
+  r.connected = true
+
+  if r.username.len > 0:
+    await r.auth(r.username, r.password)
+  elif r.password.len > 0:
+    await r.auth(r.password)
+  if r.db != 0:
+    discard await r.select(r.db)
 
 # Server
 

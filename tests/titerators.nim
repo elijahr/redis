@@ -182,15 +182,14 @@ suite "Redis Cursor Scanning & Native Iterators (Sync)":
       check s > 0.0
       count.inc
     check count == 20
-
-  test "hscan, sscan, and zscan raise on WRONGTYPE":
+  test "hscan, sscan, and zscan raise RedisResponseError on WRONGTYPE":
     discard r.del(@["test:wrongtype:str"])
     r.setk("test:wrongtype:str", "just_a_string")
-    expect RedisError:
+    expect RedisResponseError:
       discard r.hscan("test:wrongtype:str", 0)
-    expect RedisError:
+    expect RedisResponseError:
       discard r.sscan("test:wrongtype:str", 0)
-    expect RedisError:
+    expect RedisResponseError:
       discard r.zscan("test:wrongtype:str", 0)
 
   test "hPairs handles empty string key correctly":
