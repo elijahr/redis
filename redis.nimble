@@ -18,3 +18,5 @@ task test, "Run tests":
   exec "nim c -r tests/main.nim"
   exec "nim c -r --threads:on tests/main.nim"
   exec "nim c -r tests/tclosedconn.nim"
+  exec "nim c -r tests/tscripting.nim"
+  exec "nim c -r tests/trawcommand.nim"
