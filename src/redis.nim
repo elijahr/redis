@@ -1484,6 +1484,8 @@ proc zmscore*(r: Redis | AsyncRedis, key: string, members: seq[string]): Future[
   await r.sendCommand("ZMSCORE", key, members)
   let reply = await r.readResp()
   finaliseCommand(r)
+  if reply.kind == respError:
+    raiseRedisError(r, reply.value)
   result = @[]
   if reply.kind == respArray:
     for elem in reply.elements:
@@ -1497,6 +1499,8 @@ proc zpopmin*(r: Redis | AsyncRedis, key: string, count: int = 1): Future[seq[tu
   await r.sendCommand("ZPOPMIN", key, @[$count])
   let reply = await r.readResp()
   finaliseCommand(r)
+  if reply.kind == respError:
+    raiseRedisError(r, reply.value)
   result = @[]
   if reply.kind == respArray:
     for i in countup(0, reply.elements.len - 1, 2):
@@ -1508,31 +1512,37 @@ proc zpopmax*(r: Redis | AsyncRedis, key: string, count: int = 1): Future[seq[tu
   await r.sendCommand("ZPOPMAX", key, @[$count])
   let reply = await r.readResp()
   finaliseCommand(r)
+  if reply.kind == respError:
+    raiseRedisError(r, reply.value)
   result = @[]
   if reply.kind == respArray:
     for i in countup(0, reply.elements.len - 1, 2):
       if i + 1 < reply.elements.len:
         result.add((reply.elements[i].value, parseFloat(reply.elements[i+1].value)))
 
-proc bzpopmin*(r: Redis | AsyncRedis, keys: seq[string], timeout: float = 0.0): Future[Option[tuple[key, member: string, score: float]]] {.multisync.} =
+proc bzpopmin*(r: Redis | AsyncRedis, keys: seq[string], timeout: int = 0): Future[Option[tuple[key, member: string, score: float]]] {.multisync.} =
   ## Blocking pop of member with lowest score across sorted sets (Redis 5.0+)
   var args = keys
   args.add($timeout)
   await r.sendCommand("BZPOPMIN", args)
   let reply = await r.readResp()
   finaliseCommand(r)
+  if reply.kind == respError:
+    raiseRedisError(r, reply.value)
   if reply.kind == respArray and reply.elements.len >= 3:
     result = some((reply.elements[0].value, reply.elements[1].value, parseFloat(reply.elements[2].value)))
   else:
     result = none(tuple[key, member: string, score: float])
 
-proc bzpopmax*(r: Redis | AsyncRedis, keys: seq[string], timeout: float = 0.0): Future[Option[tuple[key, member: string, score: float]]] {.multisync.} =
+proc bzpopmax*(r: Redis | AsyncRedis, keys: seq[string], timeout: int = 0): Future[Option[tuple[key, member: string, score: float]]] {.multisync.} =
   ## Blocking pop of member with highest score across sorted sets (Redis 5.0+)
   var args = keys
   args.add($timeout)
   await r.sendCommand("BZPOPMAX", args)
   let reply = await r.readResp()
   finaliseCommand(r)
+  if reply.kind == respError:
+    raiseRedisError(r, reply.value)
   if reply.kind == respArray and reply.elements.len >= 3:
     result = some((reply.elements[0].value, reply.elements[1].value, parseFloat(reply.elements[2].value)))
   else:

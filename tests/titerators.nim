@@ -52,7 +52,7 @@ suite "Redis Modern Hash and Sorted Set Verbs (Sync)":
   test "bzpopmin and bzpopmax (Redis 5.0+)":
     discard r.del(@["test:zset:bpop"])
     discard r.zadd("test:zset:bpop", 100, "hundred")
-    let popped = r.bzpopmin(@["test:zset:bpop"], 1.0)
+    let popped = r.bzpopmin(@["test:zset:bpop"], 1)
     check popped.isSome
     let (key, mem, sc) = popped.get()
     check key == "test:zset:bpop"

@@ -73,5 +73,5 @@ template xfailBefore*(r: Redis, minMajor: int, minMinor: int, body: untyped) =
   if r.isAtLeastVersion(minMajor, minMinor):
     body
   else:
-    expect RedisError:
+    expect CatchableError:
       body
