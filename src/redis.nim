@@ -2154,8 +2154,11 @@ proc reconnect*(r: Redis) =
 
   r.connected = false
   if r.isUnix:
-    r.socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
-    r.socket.connectUnix(r.unixPath)
+    when defined(posix):
+      r.socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
+      r.socket.connectUnix(r.unixPath)
+    else:
+      raise newException(RedisError, "Unix domain sockets are not supported on this platform")
   else:
     r.socket = newSocket(buffered = true)
     if r.connectTimeoutMs > 0:
@@ -2187,8 +2190,11 @@ proc reconnect*(r: AsyncRedis): Future[void] {.async.} =
 
   r.connected = false
   if r.isUnix:
-    r.socket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
-    await r.socket.connectUnix(r.unixPath)
+    when defined(posix):
+      r.socket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
+      await r.socket.connectUnix(r.unixPath)
+    else:
+      raise newException(RedisError, "Unix domain sockets are not supported on this platform")
   else:
     r.socket = newAsyncSocket(buffered = true)
     if r.connectTimeoutMs > 0:
