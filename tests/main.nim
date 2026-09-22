@@ -1,7 +1,14 @@
-import redis, unittest, asyncdispatch
+import redis, unittest, asyncdispatch, os, strutils
+
+proc getClient(): Redis =
+  redis.open(getEnv("REDIS_HOST", "localhost"), Port(parseInt(getEnv("REDIS_PORT", "6379"))))
+
+proc getAsyncClient(): Future[AsyncRedis] {.async.} =
+  await redis.openAsync(getEnv("REDIS_HOST", "localhost"), Port(parseInt(getEnv("REDIS_PORT", "6379"))))
 
 template syncTests() =
-  let r = redis.open("localhost")
+  let r = getClient()
+  discard r.flushdb()
   let keys = r.keys("*")
   doAssert keys.len == 0, "Don't want to mess up an existing DB."
 
@@ -177,7 +184,8 @@ suite "redis tests":
   syncTests()
 
 suite "redis async tests":
-  let r = waitFor redis.openAsync("localhost")
+  let r = waitFor getAsyncClient()
+  discard waitFor r.flushdb()
   let keys = waitFor r.keys("*")
   doAssert keys.len == 0, "Don't want to mess up an existing DB."
 
@@ -207,8 +215,8 @@ suite "redis async tests":
   test "pub/sub":
 
     proc main() {.async.} =
-      let sub = waitFor redis.openAsync("localhost")
-      let pub = waitFor redis.openAsync("localhost")
+      let sub = waitFor getAsyncClient()
+      let pub = waitFor getAsyncClient()
 
       let listerns = await pub.publish("channel1", "hi there")
       doAssert listerns == 0

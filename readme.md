@@ -1,6 +1,13 @@
-# redis [![CircleCI](https://circleci.com/gh/nim-lang/redis.svg?style=svg)](https://circleci.com/gh/nim-lang/redis)
+# redis [![CI](https://github.com/nim-lang/redis/actions/workflows/ci.yml/badge.svg)](https://github.com/nim-lang/redis/actions/workflows/ci.yml)
 
-A redis client for Nim.
+A Redis and Valkey client for Nim.
+
+## Compatibility
+
+Tested and verified against:
+* **Redis**: 5.0, 6.0, 6.2, 7.0, 7.2+
+* **Valkey**: 7.2, 8.0+
+* **Nim**: 2.0.x, 2.2.x, and nightly `devel`
 
 ## Installation
 
