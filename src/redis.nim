@@ -34,7 +34,7 @@
 ##
 ##    waitFor main()
 
-import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, nativesockets
 import ./redis/values
 export values
 
@@ -42,15 +42,16 @@ const
   redisNil* = "\0\0"
 
 type
-  Pipeline = ref object
-    enabled: bool
-    buffer: string
-    expected: int ## number of replies expected if pipelined
+  Pipeline* = object
+    enabled*: bool
+    buffer*: string
+    expected*: int ## number of replies expected if pipelined
 
   RedisBase[TSocket] = ref object of RootObj
-    socket: TSocket
-    connected: bool
-    pipeline: Pipeline
+    socket*: TSocket
+    connected*: bool
+    pipeline*: Pipeline
+    readTimeoutMs*: int
 
   Redis* = ref object of RedisBase[net.Socket]
     ## A synchronous redis client.
@@ -70,8 +71,13 @@ type
     ## Pub/Sub
     channel*: string
     message*: string
-  ReplyError* = object of IOError ## Invalid reply from redis
-  RedisError* = object of IOError ## Error in redis
+  RedisError* = object of IOError ## Base error in redis
+  ReplyError* = object of RedisError ## Invalid reply from redis
+  RedisProtocolError* = object of ReplyError ## Protocol framing or serialization error
+  RedisConnectionError* = object of RedisError ## Connection establishment or socket drop error
+  RedisTimeoutError* = object of RedisConnectionError ## Connection or socket action timeout
+  RedisResponseError* = object of RedisError ## Server error reply (e.g. -ERR, -WRONGTYPE)
+    errorCode*: string
 
   RedisCursor* = ref object
     position*: BiggestInt
@@ -85,11 +91,9 @@ type
     ## Result of an XREAD or XREADGROUP operation on a stream.
     stream*: string
     entries*: seq[StreamEntry]
-proc newPipeline(): Pipeline =
-  new(result)
-  result.buffer = ""
-  result.enabled = false
-  result.expected = 0
+
+proc newPipeline*(): Pipeline =
+  Pipeline(enabled: false, buffer: "", expected: 0)
 
 proc newCursor*(pos: BiggestInt = 0): RedisCursor =
   result = RedisCursor(
@@ -125,43 +129,120 @@ proc contains*(entry: StreamEntry, field: string): bool {.inline.} =
   ## Test whether a field exists in a StreamEntry using the `in` operator.
   entry.hasField(field)
 
-proc open*(host = "localhost", port = 6379.Port): Redis =
+proc auth*(r: Redis, password: string) {.gcsafe.}
+proc auth*(r: AsyncRedis, password: string): Future[void] {.gcsafe.}
+proc auth*(r: Redis, username, password: string) {.gcsafe.}
+proc auth*(r: AsyncRedis, username, password: string): Future[void] {.gcsafe.}
+proc select*(r: Redis, index: int): RedisStatus {.gcsafe.}
+proc select*(r: AsyncRedis, index: int): Future[RedisStatus] {.gcsafe.}
+
+proc open*(host = "localhost", port = 6379.Port,
+           password = "", username = "", db = 0,
+           connectTimeoutMs = -1, readTimeoutMs = -1): Redis {.gcsafe.} =
   ## Open a synchronous connection to a redis server.
   result = Redis(
     socket: newSocket(buffered = true),
-    pipeline: newPipeline()
+    pipeline: newPipeline(),
+    connected: false,
+    readTimeoutMs: readTimeoutMs
   )
 
-  result.socket.connect(host, port)
+  if connectTimeoutMs > 0:
+    try:
+      result.socket.connect(host, port, timeout = connectTimeoutMs)
+    except net.TimeoutError:
+      result.socket.close()
+      raise newException(RedisTimeoutError, "Connection to " & host & ":" & $port.int & " timed out after " & $connectTimeoutMs & "ms")
+  else:
+    result.socket.connect(host, port)
 
-proc openUnix*(path = "/var/run/redis/redis.sock"): Redis =
+  result.connected = true
+
+  if username.len > 0:
+    result.auth(username, password)
+  elif password.len > 0:
+    result.auth(password)
+  if db != 0:
+    discard result.select(db)
+
+proc openUnix*(path = "/var/run/redis/redis.sock",
+               password = "", username = "", db = 0,
+               connectTimeoutMs = -1, readTimeoutMs = -1): Redis {.gcsafe.} =
   ## Open a synchronous unix connection to a redis server.
-  result = Redis(
-    socket: newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
-    pipeline: newPipeline()
-  )
+  when defined(posix):
+    result = Redis(
+      socket: newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
+      pipeline: newPipeline(),
+      connected: false,
+      readTimeoutMs: readTimeoutMs
+    )
+    result.socket.connectUnix(path)
+    result.connected = true
+    if username.len > 0:
+      result.auth(username, password)
+    elif password.len > 0:
+      result.auth(password)
+    if db != 0:
+      discard result.select(db)
+  else:
+    raise newException(RedisError, "Unix domain sockets are not supported on this platform")
 
-  result.socket.connectUnix(path)
-
-proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.async.} =
+proc openAsync*(host = "localhost", port = 6379.Port,
+                password = "", username = "", db = 0,
+                connectTimeoutMs = -1, readTimeoutMs = -1): Future[AsyncRedis] {.async.} =
   ## Open an asynchronous connection to a redis server.
   result = AsyncRedis(
     socket: newAsyncSocket(buffered = true),
     pipeline: newPipeline(),
-    sendQueue: initDeque[Future[void]]()
+    sendQueue: initDeque[Future[void]](),
+    connected: false,
+    readTimeoutMs: readTimeoutMs
   )
 
-  await result.socket.connect(host, port)
+  if connectTimeoutMs > 0:
+    let connectFut = result.socket.connect(host, port)
+    if not await withTimeout(connectFut, connectTimeoutMs):
+      result.connected = false
+      try: result.socket.close() except CatchableError: discard
+      raise newException(RedisTimeoutError, "Connection to " & host & ":" & $port.int & " timed out after " & $connectTimeoutMs & "ms")
+    if connectFut.failed:
+      result.connected = false
+      try: result.socket.close() except CatchableError: discard
+      raise connectFut.readError()
+  else:
+    await result.socket.connect(host, port)
 
-proc openUnixAsync*(path = "/var/run/redis/redis.sock"): Future[AsyncRedis] {.async.} =
+  result.connected = true
+
+  if username.len > 0:
+    await result.auth(username, password)
+  elif password.len > 0:
+    await result.auth(password)
+  if db != 0:
+    discard await result.select(db)
+
+proc openUnixAsync*(path = "/var/run/redis/redis.sock",
+                    password = "", username = "", db = 0,
+                    connectTimeoutMs = -1, readTimeoutMs = -1): Future[AsyncRedis] {.async.} =
   ## Open an asynchronous unix connection to a redis server.
-  result = AsyncRedis(
-    socket: newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
-    pipeline: newPipeline(),
-    sendQueue: initDeque[Future[void]]()
-  )
-
-  await result.socket.connectUnix(path)
+  when defined(posix):
+    result = AsyncRedis(
+      socket: newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
+      pipeline: newPipeline(),
+      sendQueue: initDeque[Future[void]](),
+      connected: false,
+      readTimeoutMs: readTimeoutMs
+    )
+    await result.socket.connectUnix(path)
+    result.connected = true
+    if username.len > 0:
+      await result.auth(username, password)
+    elif password.len > 0:
+      await result.auth(password)
+    if db != 0:
+      discard await result.select(db)
+  else:
+    raise newException(RedisError, "Unix domain sockets are not supported on this platform")
 
 proc finaliseCommand(r: Redis | AsyncRedis) =
   when r is AsyncRedis:
@@ -176,14 +257,34 @@ proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
 
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
-  raise newException(RedisError, msg)
+  var code = ""
+  if msg.len > 0:
+    let parts = msg.split(' ', 1)
+    code = parts[0]
+    if code.startsWith("-"):
+      code = code.substr(1)
+  var ex = newException(RedisResponseError, msg)
+  ex.errorCode = code
+  raise ex
+
+proc isSocketClosed*(s: net.Socket): bool =
+  s == nil or s.getFd() == osInvalidSocket
+
+proc isSocketClosed*(s: asyncnet.AsyncSocket): bool =
+  s == nil or s.isClosed()
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string
 ): Future[void] {.multisync.} =
   when r is Redis:
-    r.socket.send(data)
+    try:
+      r.socket.send(data, flags = {})
+    except CatchableError as sendErr:
+      r.connected = false
+      try: r.socket.close() except CatchableError: discard
+      raise newException(RedisConnectionError, "Send failed: " & sendErr.msg, sendErr)
   else:
+
     proc doSend() =
       r.currentCommand = some(data)
       asyncCheck r.socket.send(data)
@@ -201,27 +302,95 @@ proc managedRecv(
   result = newString(size)
 
   when r is Redis:
-    if r.socket.recv(result, size) != size:
-      raiseReplyError(r, "recv failed")
+    if r.readTimeoutMs > 0:
+      var numRecv = 0
+      try:
+        numRecv = r.socket.recv(result, size, timeout = r.readTimeoutMs)
+      except net.TimeoutError:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read timed out after " & $r.readTimeoutMs & "ms")
+      except CatchableError as e:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisConnectionError, "Recv failed: " & e.msg, e)
+      if numRecv != size:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        raiseReplyError(r, "recv failed")
+    else:
+      if r.socket.recv(result, size) != size:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        raiseReplyError(r, "recv failed")
   else:
-    let numReceived = await r.socket.recvInto(addr result[0], size)
-    if numReceived != size:
-      raiseReplyError(r, "recv failed")
+    if r.readTimeoutMs > 0:
+      let fut = r.socket.recvInto(addr result[0], size)
+      if not await withTimeout(fut, r.readTimeoutMs):
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read timed out after " & $r.readTimeoutMs & "ms")
+      if fut.failed:
+        r.connected = false
+        finaliseCommand(r)
+        raise fut.readError()
+      let numReceived = fut.read()
+      if numReceived != size:
+        r.connected = false
+        raiseReplyError(r, "recv failed")
+    else:
+      let numReceived = await r.socket.recvInto(addr result[0], size)
+      if numReceived != size:
+        r.connected = false
+        raiseReplyError(r, "recv failed")
 
 proc managedRecvLine(r: Redis | AsyncRedis): Future[string] {.multisync.} =
   if r.pipeline.enabled:
     return ""
 
   when r is Redis:
-    result = recvLine(r.socket)
+    if r.readTimeoutMs > 0:
+      try:
+        result = recvLine(r.socket, timeout = r.readTimeoutMs)
+      except net.TimeoutError:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read line timed out after " & $r.readTimeoutMs & "ms")
+      except CatchableError as e:
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisConnectionError, "Recv line failed: " & e.msg, e)
+    else:
+      result = recvLine(r.socket)
   else:
-    result = await recvLine(r.socket)
+    if r.readTimeoutMs > 0:
+      let fut = recvLine(r.socket)
+      if not await withTimeout(fut, r.readTimeoutMs):
+        r.connected = false
+        try: r.socket.close() except CatchableError: discard
+        finaliseCommand(r)
+        raise newException(RedisTimeoutError, "Read line timed out after " & $r.readTimeoutMs & "ms")
+      if fut.failed:
+        r.connected = false
+        finaliseCommand(r)
+        raise fut.readError()
+      result = fut.read()
+    else:
+      result = await recvLine(r.socket)
 
   # recvLine returns "" only when the peer closed the connection; an empty
   # protocol line would be returned as "\r\L". Raise here so callers can
   # treat an empty result as the pipelining dummy.
   if result.len == 0:
-    raiseRedisError(r, "Server closed connection prematurely")
+    r.connected = false
+    try: r.socket.close() except CatchableError: discard
+    finaliseCommand(r)
+    raise newException(RedisConnectionError, "Server closed connection prematurely")
 
 type
   RespKind = enum
@@ -244,7 +413,11 @@ proc readResp(r: Redis | AsyncRedis): Future[RespReply] {.multisync.} =
   ## that happen to carry the same text.
   let line = await r.managedRecvLine()
   if line.len == 0:
-    raiseReplyError(r, "readResp called while pipelining is enabled")
+    if r.pipeline.enabled:
+      raiseReplyError(r, "readResp called while pipelining is enabled")
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   case line[0]
   of '+':
@@ -302,7 +475,15 @@ proc toRedisValue*(reply: RespReply): RedisValue =
     var msg = reply.value
     if msg.len > 0 and msg[0] == '-':
       msg = msg.substr(1).strip()
-    raise newException(RedisError, msg)
+    var code = ""
+    if msg.len > 0:
+      let parts = msg.split(' ', 1)
+      code = parts[0]
+      if code.startsWith("-"):
+        code = code.substr(1)
+    var ex = newException(RedisResponseError, msg)
+    ex.errorCode = code
+    raise ex
   of respInteger:
     result = RedisValue(kind: vkInteger, intVal: parseBiggestInt(reply.value))
   of respBulk:
@@ -338,7 +519,8 @@ proc parseStatus(r: Redis | AsyncRedis, line: string = ""): RedisStatus =
     return "PIPELINED"
 
   if line == "":
-    raiseRedisError(r, "Server closed connection prematurely")
+    r.connected = false
+    raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -351,7 +533,11 @@ proc readStatus(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   let line = await r.managedRecvLine()
 
   if line.len == 0:
-    return "PIPELINED"
+    if r.pipeline.enabled:
+      return "PIPELINED"
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   result = r.parseStatus(line)
   finaliseCommand(r)
@@ -364,7 +550,8 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
   #  return -1
 
   if line == "":
-    raiseRedisError(r, "Server closed connection prematurely")
+    r.connected = false
+    raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -378,7 +565,11 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
 proc readInteger(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return -1
+    if r.pipeline.enabled:
+      return -1
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   result = r.parseInteger(line)
   finaliseCommand(r)
@@ -415,7 +606,11 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
   # TODO: Rename these style of procedures to `processSingleString`?
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return ""
+    if r.pipeline.enabled:
+      return ""
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   let res = await r.readSingleString(line, allowMBNil = false)
   result = res.get(redisNil)
@@ -448,14 +643,22 @@ proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList]
 proc readArrayLines(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled:
+      return @[]
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   result = await r.readArrayLines(line)
 
 proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisString] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return ""
+    if r.pipeline.enabled:
+      return ""
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   let res = await r.readSingleString(line, allowMBNil)
   result = res.get(redisNil)
@@ -464,7 +667,11 @@ proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisStri
 proc readArray(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled:
+      return @[]
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   result = await r.readArrayLines(line)
   finaliseCommand(r)
@@ -473,7 +680,11 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
 
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled:
+      return @[]
+    else:
+      r.connected = false
+      raise newException(RedisConnectionError, "Server closed connection prematurely")
 
   # TODO: This is no longer an expression due to
   # https://github.com/nim-lang/Nim/issues/8399
@@ -495,7 +706,7 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
   if r.pipeline.buffer.len > 0:
-    await r.socket.send(r.pipeline.buffer)
+    await r.socket.send(r.pipeline.buffer, flags = {})
   r.pipeline.buffer = ""
 
   r.pipeline.enabled = false
@@ -516,7 +727,7 @@ proc flushPipelineValues*(r: Redis | AsyncRedis, wasMulti = false): Future[seq[R
   ## Send buffered commands, clear buffer, and return results as a sequence of RedisValue
   ## preserving 1:1 positional integrity with queued commands.
   if r.pipeline.buffer.len > 0:
-    await r.socket.send(r.pipeline.buffer)
+    await r.socket.send(r.pipeline.buffer, flags = {})
   r.pipeline.buffer = ""
 
   r.pipeline.enabled = false
@@ -1782,19 +1993,169 @@ proc hello*(r: Redis | AsyncRedis, protover: int = 2): Future[RedisValue] {.mult
 
 proc close*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection
-  r.socket.close()
+  r.connected = false
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
 
 proc quit*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection with using QUIT command
   ## Note: This command is regarded as deprecated since Redis version 7.2.0.
   await r.sendCommand("QUIT")
   raiseNoOK(r, await r.readStatus())
-  r.socket.close()
+  r.connected = false
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
 
 proc select*(r: Redis | AsyncRedis, index: int): Future[RedisStatus] {.multisync.} =
   ## Change the selected database for the current connection
   await r.sendCommand("SELECT", $index)
   result = await r.readStatus()
+
+proc isConnected*(r: Redis | AsyncRedis): bool =
+  ## Returns true if the client is currently marked connected and socket is open.
+  r.connected and not isSocketClosed(r.socket)
+
+template withReadTimeout*(r: Redis | AsyncRedis, timeoutMs: int, body: untyped): untyped =
+  ## Scoped template to temporarily adjust the client socket read deadline,
+  ## restoring the previous deadline even if an exception occurs.
+  let oldTimeout = r.readTimeoutMs
+  r.readTimeoutMs = timeoutMs
+  try:
+    body
+  finally:
+    r.readTimeoutMs = oldTimeout
+
+proc reconnect*(r: Redis, host = "localhost", port = 6379.Port,
+                password = "", username = "", db = 0,
+                connectTimeoutMs = -1, readTimeoutMs = -1) =
+  ## Reconnect a synchronous Redis client with explicit connection parameters.
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
+
+  r.connected = false
+  r.socket = newSocket(buffered = true)
+  if connectTimeoutMs > 0:
+    try:
+      r.socket.connect(host, port, timeout = connectTimeoutMs)
+    except net.TimeoutError:
+      r.socket.close()
+      raise newException(RedisTimeoutError, "Connection to " & host & ":" & $port.int & " timed out after " & $connectTimeoutMs & "ms")
+  else:
+    r.socket.connect(host, port)
+
+  r.connected = true
+  if readTimeoutMs > 0:
+    r.readTimeoutMs = readTimeoutMs
+  if username.len > 0:
+    r.auth(username, password)
+  elif password.len > 0:
+    r.auth(password)
+  if db != 0:
+    discard r.select(db)
+
+proc reconnectUnix*(r: Redis, path = "/var/run/redis/redis.sock",
+                    password = "", username = "", db = 0,
+                    connectTimeoutMs = -1, readTimeoutMs = -1) =
+  ## Reconnect a synchronous unix Redis client with explicit connection parameters.
+  when defined(posix):
+    if r.socket != nil and not isSocketClosed(r.socket):
+      try:
+        r.socket.close()
+      except CatchableError:
+        discard
+
+    r.connected = false
+    r.socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
+    r.socket.connectUnix(path)
+    r.connected = true
+    if readTimeoutMs > 0:
+      r.readTimeoutMs = readTimeoutMs
+    if username.len > 0:
+      r.auth(username, password)
+    elif password.len > 0:
+      r.auth(password)
+    if db != 0:
+      discard r.select(db)
+  else:
+    raise newException(RedisError, "Unix domain sockets are not supported on this platform")
+
+proc reconnect*(r: AsyncRedis, host = "localhost", port = 6379.Port,
+                password = "", username = "", db = 0,
+                connectTimeoutMs = -1, readTimeoutMs = -1): Future[void] {.async.} =
+  ## Reconnect an asynchronous Redis client with explicit connection parameters.
+  r.currentCommand = none(string)
+  if r.socket != nil and not isSocketClosed(r.socket):
+    try:
+      r.socket.close()
+    except CatchableError:
+      discard
+
+  r.connected = false
+  r.socket = newAsyncSocket(buffered = true)
+  if connectTimeoutMs > 0:
+    let connectFut = r.socket.connect(host, port)
+    if not await withTimeout(connectFut, connectTimeoutMs):
+      r.connected = false
+      try:
+        r.socket.close()
+      except CatchableError:
+        discard
+      raise newException(RedisTimeoutError, "Connection to " & host & ":" & $port.int & " timed out after " & $connectTimeoutMs & "ms")
+    if connectFut.failed:
+      r.connected = false
+      try:
+        r.socket.close()
+      except CatchableError:
+        discard
+      raise connectFut.readError()
+  else:
+    await r.socket.connect(host, port)
+
+  r.connected = true
+  if readTimeoutMs > 0:
+    r.readTimeoutMs = readTimeoutMs
+  if username.len > 0:
+    await r.auth(username, password)
+  elif password.len > 0:
+    await r.auth(password)
+  if db != 0:
+    discard await r.select(db)
+
+proc reconnectUnix*(r: AsyncRedis, path = "/var/run/redis/redis.sock",
+                    password = "", username = "", db = 0,
+                    connectTimeoutMs = -1, readTimeoutMs = -1): Future[void] {.async.} =
+  ## Reconnect an asynchronous unix Redis client with explicit connection parameters.
+  when defined(posix):
+    r.currentCommand = none(string)
+    if r.socket != nil and not isSocketClosed(r.socket):
+      try:
+        r.socket.close()
+      except CatchableError:
+        discard
+
+    r.connected = false
+    r.socket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false)
+    await r.socket.connectUnix(path)
+    r.connected = true
+    if readTimeoutMs > 0:
+      r.readTimeoutMs = readTimeoutMs
+    if username.len > 0:
+      await r.auth(username, password)
+    elif password.len > 0:
+      await r.auth(password)
+    if db != 0:
+      discard await r.select(db)
+  else:
+    raise newException(RedisError, "Unix domain sockets are not supported on this platform")
 
 # Server
 
