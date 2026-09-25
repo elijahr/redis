@@ -19,21 +19,33 @@ suite "Redis Timeouts and Socket Deadlines (Sync)":
     check elapsed < 2.0
     check r.isConnected == false
 
-  test "setTimeouts dynamically tunes socket deadlines":
+  test "readTimeoutMs dynamically tunes socket deadlines":
     let r = redis.open(getHost(), getPort())
     discard r.flushdb()
     r.setk("test:dynamic:k", "hello")
 
-    # Set aggressive read timeout
-    r.setTimeouts(readTimeoutMs = 200)
+    # Set aggressive read timeout directly on the public field
+    r.readTimeoutMs = 200
     expect RedisTimeoutError:
       discard r.bLPop(@["test:dynamic:nonexistent"], timeout = 4)
 
     # Reconnect and restore indefinite timeout
-    r.reconnect()
-    r.setTimeouts(readTimeoutMs = -1)
+    r.reconnect(getHost(), getPort())
+    r.readTimeoutMs = -1
     check r.get("test:dynamic:k") == "hello"
     r.quit()
+
+  test "withReadTimeout restores previous timeout even on error":
+    let r = redis.open(getHost(), getPort(), readTimeoutMs = 5000)
+    discard r.flushdb()
+
+    expect RedisTimeoutError:
+      withReadTimeout(r, 200):
+        discard r.bLPop(@["test:dynamic:nonexistent2"], timeout = 4)
+
+    # Verify original timeout was restored and socket closed on timeout
+    check r.readTimeoutMs == 5000
+    check r.isConnected == false
 
   test "connectTimeoutMs fails fast on unreachable endpoint":
     let start = epochTime()
@@ -52,34 +64,32 @@ suite "Redis Reconnect & State Retention (Sync)":
     # Simulate dropped socket
     r.socket.close()
 
-    r.reconnect()
+    r.reconnect(getHost(), getPort())
     check r.isConnected == true
     check r.get("test:recon:k") == "persisted"
     r.quit()
 
-  test "reconnect preserves database selection":
+  test "reconnect selects database explicitly":
     let r = redis.open(getHost(), getPort(), db = 14)
     discard r.flushdb()
     r.setk("test:db14:k", "in_14")
 
     r.socket.close()
-    r.reconnect()
+    r.reconnect(getHost(), getPort(), db = 14)
 
-    check r.db == 14
     check r.get("test:db14:k") == "in_14"
     r.quit()
 
-  test "autoReconnect recovers transparently on command dispatch":
-    let r = redis.open(getHost(), getPort(), autoReconnect = true)
+  test "reconnect restores connection after manual close":
+    let r = redis.open(getHost(), getPort())
     discard r.flushdb()
-    r.setk("test:auto:k", "auto_value")
+    r.setk("test:manual:k", "manual_val")
 
-    # Sever connection
     r.socket.close()
-
-    # Next command should auto-reconnect and succeed
-    check r.get("test:auto:k") == "auto_value"
+    check r.isConnected == false
+    r.reconnect(getHost(), getPort())
     check r.isConnected == true
+    check r.get("test:manual:k") == "manual_val"
     r.quit()
 
 suite "Redis Timeouts and Reconnect (Async)":
@@ -117,16 +127,17 @@ suite "Redis Timeouts and Reconnect (Async)":
 
     waitFor runTest()
 
-  test "Async manual reconnect and autoReconnect":
+  test "Async manual reconnect":
     proc runTest() {.async.} =
-      let r = await redis.openAsync(getHost(), getPort(), autoReconnect = true)
+      let r = await redis.openAsync(getHost(), getPort())
       discard await r.flushdb()
       await r.setk("test:async:recon", "async_val")
 
       # Sever connection
       r.socket.close()
+      check r.isConnected == false
 
-      # Auto-reconnect on next send
+      await r.reconnect(getHost(), getPort())
       check (await r.get("test:async:recon")) == "async_val"
       check r.isConnected == true
       await r.quit()
@@ -164,24 +175,18 @@ suite "Redis Error Hierarchy and Diagnostics":
     check r.socket.isSocketClosed() == true
     check r.isConnected == false
 
-  test "ACL credentials and backoff options are retained":
-    let r = redis.open(getHost(), getPort(),
-                       retryIntervalMs = 50, maxRetryIntervalMs = 2000, backoffMultiplier = 1.5)
-    check r.retryIntervalMs == 50
-    check r.maxRetryIntervalMs == 2000
-    check r.backoffMultiplier == 1.5
-
+  test "reconnect with ACL credentials":
+    let r = redis.open(getHost(), getPort())
     # If Redis supports ACLs (Redis 6+), create a temporary user and verify reconnect with ACL
     try:
       discard r.rawCommand("ACL", @["SETUSER", "testacl", "on", ">testpass", "~*", "&*", "+@all"])
       let rAcl = redis.open(getHost(), getPort(), username = "testacl", password = "testpass")
-      check rAcl.username == "testacl"
-      check rAcl.password == "testpass"
       check rAcl.isConnected == true
 
-      # Sever and reconnect to verify ACL credentials were kept and re-authenticated
+      # Sever and reconnect with explicit credentials
       rAcl.socket.close()
-      rAcl.reconnect()
+      check rAcl.isConnected == false
+      rAcl.reconnect(getHost(), getPort(), username = "testacl", password = "testpass")
       check rAcl.isConnected == true
       check rAcl.ping() == "PONG"
       rAcl.quit()
