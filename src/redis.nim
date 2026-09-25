@@ -35,6 +35,8 @@
 ##    waitFor main()
 
 import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import ./redis/values
+export values
 
 const
   redisNil* = "\0\0"
@@ -71,20 +73,6 @@ type
   ReplyError* = object of IOError ## Invalid reply from redis
   RedisError* = object of IOError ## Error in redis
 
-  RedisValueKind* = enum
-    vkNil,
-    vkStatus,
-    vkInteger,
-    vkString,
-    vkList
-
-  RedisValue* = object
-    case kind*: RedisValueKind
-    of vkNil: discard
-    of vkStatus, vkString: strVal*: string
-    of vkInteger: intVal*: BiggestInt
-    of vkList: listVal*: seq[RedisValue]
-
   RedisCursor* = ref object
     position*: BiggestInt
 
@@ -97,81 +85,6 @@ type
     ## Result of an XREAD or XREADGROUP operation on a stream.
     stream*: string
     entries*: seq[StreamEntry]
-
-proc `$`*(val: RedisValue): string =
-  case val.kind
-  of vkNil: result = "nil"
-  of vkStatus, vkString: result = val.strVal
-  of vkInteger: result = $val.intVal
-  of vkList:
-    result = "["
-    for i, elem in val.listVal:
-      if i > 0: result.add(", ")
-      result.add($elem)
-    result.add("]")
-
-proc toInt*(val: RedisValue): BiggestInt =
-  case val.kind
-  of vkInteger: result = val.intVal
-  of vkStatus, vkString: result = parseBiggestInt(val.strVal)
-  of vkNil: result = 0.BiggestInt
-  else: raise newException(ValueError, "Cannot convert Redis list to integer")
-
-proc toStr*(val: RedisValue): string =
-  case val.kind
-  of vkStatus, vkString: result = val.strVal
-  of vkInteger: result = $val.intVal
-  of vkNil: result = ""
-  else: result = $val
-
-proc toSeq*(val: RedisValue): seq[RedisValue] =
-  case val.kind
-  of vkList: result = val.listVal
-  of vkNil: result = @[]
-  else: result = @[val]
-
-proc len*(val: RedisValue): int =
-  if val.kind == vkList: result = val.listVal.len
-  elif val.kind == vkNil: result = 0
-  else: result = 1
-
-proc `[]`*(val: RedisValue, i: int): RedisValue =
-  if val.kind == vkList: result = val.listVal[i]
-  else: raise newException(IndexDefect, "RedisValue is not a list")
-
-proc `==`*(a, b: RedisValue): bool =
-  if a.kind != b.kind: return false
-  case a.kind
-  of vkNil: return true
-  of vkStatus, vkString: return a.strVal == b.strVal
-  of vkInteger: return a.intVal == b.intVal
-  of vkList:
-    if a.listVal.len != b.listVal.len: return false
-    for i in 0 ..< a.listVal.len:
-      if not (a.listVal[i] == b.listVal[i]): return false
-    return true
-
-proc `==`*(a: RedisValue, b: string): bool =
-  case a.kind
-  of vkStatus, vkString: result = (a.strVal == b)
-  else: result = false
-
-proc `==`*(a: string, b: RedisValue): bool = b == a
-
-proc `==`*(a: RedisValue, b: BiggestInt): bool =
-  case a.kind
-  of vkInteger: result = (a.intVal == b)
-  else: result = false
-
-proc `==`*(a: BiggestInt, b: RedisValue): bool = b == a
-
-proc `==`*(a: RedisValue, b: int): bool =
-  case a.kind
-  of vkInteger: result = (a.intVal == b.BiggestInt)
-  else: result = false
-
-proc `==`*(a: int, b: RedisValue): bool = b == a
-
 proc newPipeline(): Pipeline =
   new(result)
   result.buffer = ""
@@ -203,6 +116,14 @@ proc hasField*(entry: StreamEntry, field: string): bool =
   for (f, _) in entry.fields:
     if f == field: return true
   return false
+
+proc `[]`*(entry: StreamEntry, field: string): string {.inline.} =
+  ## Retrieve the value of a field in a StreamEntry using standard container syntax.
+  entry.getField(field)
+
+proc contains*(entry: StreamEntry, field: string): bool {.inline.} =
+  ## Test whether a field exists in a StreamEntry using the `in` operator.
+  entry.hasField(field)
 
 proc open*(host = "localhost", port = 6379.Port): Redis =
   ## Open a synchronous connection to a redis server.
@@ -2229,6 +2150,9 @@ iterator zscan*(r: Redis, key: string, pattern = "*", count = 10): tuple[member:
 # Async collectors
 proc scanAll*(r: AsyncRedis, pattern = "*", count = 100, keyType = ""): Future[seq[string]] {.async.} =
   ## Collect all matching keys using asynchronous SCAN pagination.
+  ##
+  ## **WARNING:** Buffers the entire matching keyspace into memory.
+  ## For very large datasets, use cursor-based `scan(cursor)` pagination instead.
   var cursor = 0
   var first = true
   result = @[]
@@ -2240,6 +2164,9 @@ proc scanAll*(r: AsyncRedis, pattern = "*", count = 100, keyType = ""): Future[s
 
 proc hscanAll*(r: AsyncRedis, key: string, pattern = "*", count = 100): Future[seq[tuple[field, value: string]]] {.async.} =
   ## Collect all field-value pairs using asynchronous HSCAN pagination.
+  ##
+  ## **WARNING:** Buffers the entire hash into memory.
+  ## For very large hashes, use cursor-based `hscan(key, cursor)` pagination instead.
   var cursor = 0
   var first = true
   result = @[]
@@ -2251,6 +2178,9 @@ proc hscanAll*(r: AsyncRedis, key: string, pattern = "*", count = 100): Future[s
 
 proc sscanAll*(r: AsyncRedis, key: string, pattern = "*", count = 100): Future[seq[string]] {.async.} =
   ## Collect all set members using asynchronous SSCAN pagination.
+  ##
+  ## **WARNING:** Buffers the entire set into memory.
+  ## For very large sets, use cursor-based `sscan(key, cursor)` pagination instead.
   var cursor = 0
   var first = true
   result = @[]
@@ -2262,6 +2192,9 @@ proc sscanAll*(r: AsyncRedis, key: string, pattern = "*", count = 100): Future[s
 
 proc zscanAll*(r: AsyncRedis, key: string, pattern = "*", count = 100): Future[seq[tuple[member: string, score: float]]] {.async.} =
   ## Collect all sorted set member-score pairs using asynchronous ZSCAN pagination.
+  ##
+  ## **WARNING:** Buffers the entire sorted set into memory.
+  ## For very large sets, use cursor-based `zscan(key, cursor)` pagination instead.
   var cursor = 0
   var first = true
   result = @[]

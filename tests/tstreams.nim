@@ -42,10 +42,15 @@ suite "Redis Streams (Sync)":
     check entries.len == 3
     check entries[0].id == "1-0"
     check entries[0].hasField("k1")
+    check "k1" in entries[0]
     check entries[0].getField("k1") == "v1"
+    check entries[0]["k1"] == "v1"
     check entries[0].getField("k2") == "v2"
+    check entries[0]["k2"] == "v2"
     check entries[0].hasField("nonexistent") == false
+    check "nonexistent" notin entries[0]
     check entries[0].getField("nonexistent") == ""
+    check entries[0]["nonexistent"] == ""
 
     check entries[2].id == "3-0"
     check entries[2].getField("k1") == "v5"
